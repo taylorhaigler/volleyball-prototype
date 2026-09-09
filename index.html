@@ -59,7 +59,7 @@
   }
   #cameraDock .dot{ width:6px; height:6px; border-radius:50%; background:#555; box-shadow:0 0 0 rgba(0,0,0,0); }
   #cameraDock .dot.live{ background:#39ff8a; box-shadow:0 0 6px #39ff8a; }
-  #camWrap{ position:relative; width:100%; aspect-ratio:4/3; background:#000; }
+  #camWrap{ position:relative; width:100%; aspect-ratio:4/3; background:#000; cursor:pointer; }
   #camVideo{ width:100%; height:100%; object-fit:cover; transform:scaleX(-1); display:block; }
   #camOverlay{ position:absolute; inset:0; width:100%; height:100%; transform:scaleX(-1); }
   #camStatus{ font-size:10px; color:var(--text-dim); padding:5px 8px 7px; line-height:1.4; }
@@ -531,7 +531,10 @@ function drawEvents(t,dt){
 /* =========================================================================================
    EVENT TRIGGERS  (shared by dev-panel + camera CV heuristics)
    ========================================================================================= */
-function triggerContact(playerIdx){
+// `force` (0..1), when supplied by the camera's trajectory classifier, scales how strong
+// the contact reads; manual/rally callers just leave it at the default.
+function triggerContact(playerIdx, force){
+  if (force === undefined) force = 0.5;
   const prevHue = currentPlayer().hue;
   if (playerIdx !== undefined){
     const newIdx = playerIdx % state.numPlayers;
@@ -547,12 +550,15 @@ function triggerContact(playerIdx){
   const p = currentPlayer();
   // no ripple/flash here — contact is expressed purely through the hue sweep + energy
   // pulse in the color field itself; ripples are reserved for a detected wall hit.
-  swellAudio(0.5);
+  swellAudio(clamp(0.35 + force*0.5, 0, 1));
   renderPlayerButtons();
   logEvent(`${p.name} — contact`);
 }
 
-function triggerWallHit(){
+// `point` ({x,y} normalized 0..1), when supplied by the camera, is the ball's real detected
+// position — the ripple spawns right where it actually hit rather than a random edge point.
+// `force` (0..1) overrides the speed-based intensity estimate when the classifier supplies one.
+function triggerWallHit(point, force){
   // debounce: a real wall hit is a discrete, occasional event — without this, jittery
   // camera readings (or a fast rally) could re-fire it many times a second
   const now = nowSec();
@@ -562,9 +568,9 @@ function triggerWallHit(){
 
   markActivity();
   const p = currentPlayer();
-  const intensity = clamp(0.4 + state.speed*0.8, 0.2, 1);
-  const edgeX = Math.random()<0.5 ? W*0.04 : W*0.96;
-  const edgeY = lerp(H*0.82, H*0.12, state.height);
+  const intensity = force !== undefined ? force : clamp(0.4 + state.speed*0.8, 0.2, 1);
+  const edgeX = point ? point.x*W : (Math.random()<0.5 ? W*0.04 : W*0.96);
+  const edgeY = point ? point.y*H : lerp(H*0.82, H*0.12, state.height);
   // a single, slow, low-contrast ripple — soft enough not to strobe against the
   // full-screen color field, still legible as "an edge was just touched"
   const rippleColor = hsl(p.hue, 20, 92, 1);
@@ -763,14 +769,93 @@ let smoothCentroid = null;   // low-pass filtered — used for height mapping + 
 let prevTime = nowSec();
 let prevSpeedNorm = 0;
 let noBlobFrames = 0;
-let cvVerticalSign = 0;
-let cvHorizSign = 0;
 let fallStreak = 0;          // consecutive frames the blob has been descending (gates drop detection)
-let prevGray = null;          // previous frame's grayscale — reused for motion energy and the light mask
+let prevGray = null;          // previous frame's grayscale — reused for the light mask
 let lightMask = null;         // per-pixel "stayed bright without moving" score (0..1) — flags fixed
                                // ceiling lights / windows so they're never mistaken for the ball
-let localMotionHistory = [];  // rolling {t,m} samples of motion *near the ball only* — used to tell
-                               // whether a player's hand/arm is actually there right now
+
+// Tap-to-calibrate: click the camera preview once the ball is visible, and its exact color
+// (rather than a generic white/neon guess) becomes the match target — ported from the
+// iPad-Ball prototype's calibration flow.
+let calibratedTarget = null;   // {h,s,l} in the same space hslToColor... no — raw 0..255 r,g,b here
+let calibratedTolerance = 60;  // max per-channel (r,g,b) distance to still count as a match
+
+/* =========================================================================================
+   MOTION EVENT CLASSIFIER — ported from the iPad-Ball prototype: turns a stream of
+   (x,y,timestamp) samples into game events (a player hit or a wall/surface hit) via real
+   trajectory analysis — a sharp reversal of direction *and* a speed spike, rather than the
+   simple per-axis sign-flip this file used before. Also assigns a "pie slice" player index
+   from which angular slice of the frame (centered on the middle of the image) the ball was
+   in — useful when players are spread out around the camera rather than sharing one spot.
+   ========================================================================================= */
+const classifier = {
+  history: [],              // recent {t,x,y} samples, x/y normalized 0..1
+  lastEventAt: 0,
+  smoothedSpeed: 0,
+  lastVelocity: null,
+
+  hitSpeedThreshold: 0.75,        // normalized units/sec spike required to call it a hit
+  reversalAngleThreshold: 100,    // degrees of direction change to call it a "reversal"
+  wallEdgeMarginFraction: 0.12,   // fraction of width/height considered "near the edge"
+  eventCooldown: 0.28,
+
+  reset(){
+    this.history = []; this.lastEventAt = 0; this.smoothedSpeed = 0; this.lastVelocity = null;
+  },
+
+  /// Feed one new ball position. Returns {type:'hit'|'wallHit', force, quadrant} or null.
+  update(x, y, timestamp, numPlayers){
+    const prev = this.history[this.history.length-1];
+    this.history.push({t:timestamp, x, y});
+    if (this.history.length > 6) this.history.shift();
+    if (!prev) return null;
+
+    const dt = timestamp - prev.t;
+    if (dt <= 0.001) return null;
+
+    const vx = (x-prev.x)/dt, vy = (y-prev.y)/dt;
+    const speed = Math.sqrt(vx*vx + vy*vy);
+    // Asymmetric smoothing: react fast to a sudden speed-up, settle slowly when it calms down.
+    this.smoothedSpeed += (speed > this.smoothedSpeed ? 0.5 : 0.12) * (speed - this.smoothedSpeed);
+
+    let fired = null;
+    const cooledDown = (timestamp - this.lastEventAt) > this.eventCooldown;
+
+    if (cooledDown && this.lastVelocity){
+      const [pvx, pvy] = this.lastVelocity;
+      const prevSpeed = Math.sqrt(pvx*pvx + pvy*pvy);
+      if (speed > this.hitSpeedThreshold && prevSpeed > this.hitSpeedThreshold*0.4){
+        const dot = pvx*vx + pvy*vy;
+        const mags = prevSpeed*speed;
+        if (mags > 0){
+          const cosAngle = clamp(dot/mags, -1, 1);
+          const angleDeg = Math.acos(cosAngle) * 180/Math.PI;
+          if (angleDeg > this.reversalAngleThreshold){
+            const force = clamp(speed/(this.hitSpeedThreshold*2.2), 0, 1);
+            const nearLeftEdge = x < this.wallEdgeMarginFraction;
+            const nearRightEdge = x > 1-this.wallEdgeMarginFraction;
+            const nearTopEdge = y < this.wallEdgeMarginFraction;
+            fired = (nearLeftEdge || nearRightEdge || nearTopEdge)
+              ? { type:'wallHit', force }
+              : { type:'hit', force, quadrant: pieSlicePlayer(x, y, numPlayers) };
+            this.lastEventAt = timestamp;
+          }
+        }
+      }
+    }
+    this.lastVelocity = [vx, vy];
+    return fired;
+  }
+};
+
+/// Divides the frame into `numPlayers` equal pie slices around the center and reports
+/// which slice (x,y) — both normalized 0..1 — falls in.
+function pieSlicePlayer(x, y, numPlayers){
+  if (numPlayers <= 1) return 0;
+  const angle = Math.atan2(y-0.5, x-0.5); // -pi..pi
+  const normalized = (angle+Math.PI) / (2*Math.PI); // 0..1
+  return Math.floor(normalized*numPlayers) % numPlayers;
+}
 
 async function startCamera(){
   try{
@@ -787,12 +872,17 @@ async function startCamera(){
   }
 }
 
-// Candidate test: very bright (white) OR strongly saturated (neon) pixel — matches an
-// unmodified white/neon volleyball without needing any marker on the ball itself.
-// `staticScore` (from the light mask) excludes spots that have stayed bright without ever
-// moving: a real ball only visits a given pixel briefly, but a ceiling light or window never
-// leaves it, so a persistently-bright, motionless pixel is a fixture, not the ball.
+// Candidate test: either the tap-calibrated exact color (preferred — far more reliable,
+// see calibrateBallColor below), or a generic "very bright (white) OR strongly saturated
+// (neon)" guess, matching an unmodified white/neon volleyball without needing any marker on
+// the ball itself. `staticScore` (from the light mask) excludes spots that have stayed
+// bright without ever moving: a real ball only visits a given pixel briefly, but a ceiling
+// light or window never leaves it, so a persistently-bright, motionless pixel is a fixture.
 function isBallPixel(r,g,b,lum,staticScore){
+  if (calibratedTarget){
+    const dr = Math.abs(r-calibratedTarget.r), dg = Math.abs(g-calibratedTarget.g), db = Math.abs(b-calibratedTarget.b);
+    return Math.max(dr,dg,db) <= calibratedTolerance;
+  }
   const maxc = Math.max(r,g,b), minc = Math.min(r,g,b);
   const sat = maxc===0?0:(maxc-minc)/maxc;
   const brightCandidate = lum>195 && staticScore < 0.5;
@@ -800,40 +890,26 @@ function isBallPixel(r,g,b,lum,staticScore){
   return brightCandidate || neonCandidate;
 }
 
-// Scan a region of the (already-drawn) analysis frame for ball-candidate pixels,
-// returning their centroid + count + positional spread (for a compactness check).
+// Scan a region of the (already-drawn) analysis frame for ball-candidate pixels, returning
+// their centroid + count + bounding box — used both for the compactness/shape check and to
+// resolve the calibration tap.
 function scanRegion(imgData, gray, lightMask, x0,y0,x1,y1){
-  let sumX=0,sumY=0,count=0,sqSumX=0,sqSumY=0;
+  let sumX=0,sumY=0,count=0;
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
   for (let y=y0;y<y1;y++){
     for (let x=x0;x<x1;x++){
       const idx = y*AW+x, i = idx*4;
       const r=imgData[i], g=imgData[i+1], b=imgData[i+2];
-      if (isBallPixel(r,g,b,gray[idx],lightMask[idx])){ sumX+=x; sumY+=y; count++; sqSumX+=x*x; sqSumY+=y*y; }
+      if (isBallPixel(r,g,b,gray[idx],lightMask[idx])){
+        sumX+=x; sumY+=y; count++;
+        if (x<minX) minX=x; if (x>maxX) maxX=x;
+        if (y<minY) minY=y; if (y>maxY) maxY=y;
+      }
     }
   }
-  return {sumX,sumY,count,sqSumX,sqSumY};
+  return {sumX,sumY,count,minX,maxX,minY,maxY};
 }
 
-// Average motion energy in a small window around a normalized (0..1) point — this is how a
-// player's hand/arm is confirmed to be near the ball, rather than trusting motion detected
-// ANYWHERE in the room (which would also fire for someone just walking past in the background).
-function localMotionEnergy(gray, prevFrameGray, cx, cy, radiusFrac){
-  if (!prevFrameGray) return 0;
-  const rx = Math.max(2, Math.round(radiusFrac*AW));
-  const ry = Math.max(2, Math.round(radiusFrac*AH));
-  const cxpx = Math.round(cx*AW), cypx = Math.round(cy*AH);
-  const x0 = clamp(cxpx-rx,0,AW-1), x1 = clamp(cxpx+rx,0,AW-1);
-  const y0 = clamp(cypx-ry,0,AH-1), y1 = clamp(cypx+ry,0,AH-1);
-  let sum=0, count=0;
-  for (let y=y0;y<=y1;y++){
-    for (let x=x0;x<=x1;x++){
-      const idx = y*AW+x;
-      sum += Math.abs(gray[idx]-prevFrameGray[idx]);
-      count++;
-    }
-  }
-  return count ? clamp((sum/count)/12, 0, 1) : 0;
-}
 
 function analyzeLoop(){
   requestAnimationFrame(analyzeLoop);
@@ -850,7 +926,7 @@ function analyzeLoop(){
   try{ imgData = actx.getImageData(0,0,AW,AH).data; } catch(e){ return; }
 
   if (!lightMask) lightMask = new Float32Array(AW*AH);
-  const prevFrameGray = prevGray; // keep last frame's snapshot around for the local-motion lookup below
+  const prevFrameGray = prevGray; // last frame's snapshot, for the light-mask motion diff below
   const gray = new Float32Array(AW*AH);
 
   // ---- grayscale + per-pixel light-mask update. A fixed ceiling light or window stays
@@ -888,11 +964,18 @@ function analyzeLoop(){
 
   if (region.count > 12){
     const cx = (region.sumX/region.count)/AW, cy = (region.sumY/region.count)/AH;
-    // compactness check: reject wide, scattered pixel clouds (background noise / lighting),
-    // which a real round ball blob would never produce
-    const varX = Math.sqrt(Math.max(0, region.sqSumX/region.count - (region.sumX/region.count)**2))/AW;
-    const varY = Math.sqrt(Math.max(0, region.sqSumY/region.count - (region.sumY/region.count)**2))/AH;
-    const compact = varX < 0.22 && varY < 0.22;
+
+    // Shape sanity checks (ported from the iPad-Ball prototype) — a real ball should be
+    // roughly round and solidly filled, not a wide scattered patch of coincidentally
+    // similar-colored pixels:
+    //  - aspect ratio: bounding box close to square (1.0); lower = more stretched/elongated
+    //  - fill ratio: how much of that bounding box the matched pixels actually cover — a
+    //    filled circle covers ~78.5% (pi/4) of its own box; a sparse/ring-shaped false
+    //    match covers much less
+    const blobW = region.maxX-region.minX, blobH = region.maxY-region.minY;
+    const aspectRatio = blobW>0 && blobH>0 ? Math.min(blobW,blobH)/Math.max(blobW,blobH) : 0;
+    const fillRatio = blobW>0 && blobH>0 ? region.count/((blobW+1)*(blobH+1)) : 0;
+    const compact = aspectRatio >= 0.35 && fillRatio >= 0.15;
 
     if (compact){
       noBlobFrames = 0;
@@ -907,49 +990,27 @@ function analyzeLoop(){
       camOverlayCtx.beginPath(); camOverlayCtx.arc(px,py,radius,0,Math.PI*2); camOverlayCtx.stroke();
 
       const tNow = nowSec();
-      const dt = clamp(tNow-prevTime, 0.001, 0.5);
       if (prevCentroid){
+        const dt = clamp(tNow-prevTime, 0.001, 0.5);
         const dx = cx-prevCentroid.x, dy = cy-prevCentroid.y;
         const speedPx = Math.sqrt(dx*dx+dy*dy)/dt;
-        const speedNorm = clamp(speedPx/2.2, 0, 1);
-        prevSpeedNorm = speedNorm;
-
-        // player detection: look for arm/hand motion in a zone around the ball itself —
-        // not the whole frame, which would also fire for someone just walking past.
-        const zoneRadiusFrac = 0.24;
-        const localMotion = localMotionEnergy(gray, prevFrameGray, cx, cy, zoneRadiusFrac);
-        localMotionHistory.push({t:tNow, m:localMotion});
-        localMotionHistory = localMotionHistory.filter(e=>tNow-e.t < 0.6);
-        const recentMotion = localMotionHistory.reduce((m,e)=>Math.max(m,e.m), 0);
-        const motionNearby = recentMotion > 0.22;
-
-        // visualize the player-detection zone in the debug feed: it brightens from a dim
-        // outline to a warm glow as player motion is actually sensed near the ball, so it's
-        // clear exactly when and where a player is being picked up.
-        const zoneR = zoneRadiusFrac * Math.max(camOverlay.width, camOverlay.height);
-        camOverlayCtx.beginPath();
-        camOverlayCtx.strokeStyle = `rgba(255,200,60,${(0.15+recentMotion*0.75).toFixed(2)})`;
-        camOverlayCtx.lineWidth = 1.5 + recentMotion*2.5;
-        camOverlayCtx.arc(px, py, zoneR, 0, Math.PI*2);
-        camOverlayCtx.stroke();
+        prevSpeedNorm = clamp(speedPx/2.2, 0, 1);
 
         if (state.cvEnabled){
           state.heightTarget = clamp(1-smoothCentroid.y, 0, 1);
-          state.speedTarget = speedNorm;
+          state.speedTarget = prevSpeedNorm;
           state.height = lerp(state.height, state.heightTarget, 0.5);
           markActivity();
 
           fallStreak = dy > 0 ? fallStreak+1 : 0; // dy>0 == descending (y grows downward)
 
-          const vSign = Math.sign(dy), hSign = Math.sign(dx);
-          if (vSign !== 0 && cvVerticalSign > 0 && vSign < 0 && speedNorm > 0.32){
-            if (motionNearby) triggerContact();       // confirmed: a player redirected it
-            // else: unattended apex of the arc — normal ball movement, no event fired
-          } else if (hSign !== 0 && cvHorizSign !== 0 && hSign !== cvHorizSign && speedNorm > 0.58){
-            if (motionNearby) triggerContact(); else triggerWallHit();
+          // real trajectory analysis (direction-reversal angle + speed spike) rather than
+          // a simple per-axis sign flip — see the classifier defined above
+          const fired = classifier.update(cx, cy, tNow, state.numPlayers);
+          if (fired){
+            if (fired.type === 'hit') triggerContact(fired.quadrant, fired.force);
+            else triggerWallHit(smoothCentroid, fired.force);
           }
-          if (vSign!==0) cvVerticalSign = vSign;
-          if (hSign!==0) cvHorizSign = hSign;
           state.lastImpactPoint = { x: smoothCentroid.x*W, y: smoothCentroid.y*H };
         }
       }
@@ -1024,6 +1085,30 @@ document.getElementById('panelToggle').addEventListener('click', ()=>{
 document.getElementById('cvToggle').addEventListener('change', (e)=>{
   state.cvEnabled = e.target.checked;
   if (state.cvEnabled && !camVideo.srcObject) startCamera();
+});
+
+// Tap-to-calibrate (ported from the iPad-Ball prototype): click the ball once it's visible
+// in the preview and its exact color — far more reliable than the generic white/neon guess
+// — becomes the match target. Double-click clears it.
+document.getElementById('camWrap').addEventListener('click', (e)=>{
+  if (!state.cvEnabled) return;
+  const bounds = camOverlay.getBoundingClientRect();
+  if (bounds.width === 0) return;
+  const displayX = e.clientX - bounds.left, displayY = e.clientY - bounds.top;
+  // camOverlay/camVideo are mirrored (scaleX(-1)) for a natural "selfie" view, so flip X
+  // back to match the raw (unmirrored) analysis buffer sampled below.
+  const rawX = bounds.width - displayX;
+  const ax = clamp(Math.floor((rawX/bounds.width) * AW), 0, AW-1);
+  const ay = clamp(Math.floor((displayY/bounds.height) * AH), 0, AH-1);
+  try{
+    const px = actx.getImageData(ax, ay, 1, 1).data;
+    calibratedTarget = { r:px[0], g:px[1], b:px[2] };
+    camStatus.textContent = 'Ball color calibrated — tap again to recalibrate, double-tap to clear';
+  } catch(err){ /* frame not ready yet */ }
+});
+document.getElementById('camWrap').addEventListener('dblclick', ()=>{
+  calibratedTarget = null;
+  camStatus.textContent = 'Calibration cleared — using generic white/neon detection';
 });
 
 document.getElementById('irToggle').addEventListener('change', (e)=> setIrEnabled(e.target.checked));
