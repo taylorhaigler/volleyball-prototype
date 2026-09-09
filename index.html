@@ -234,10 +234,12 @@ const state = {
   running: false,          // auto rally demo running
   idle: true,
   lastActivityTime: nowSec(),
+  lastMotionTime: nowSec(),  // last time the ball was actually moving (drives idle detection)
   cvEnabled: false,
   irEnabled: false,
   activityLevel: 0,        // smoothed 0..1, drives audio
   interactionTimes: [],    // timestamps of recent contacts, for "frequency"
+  lastContactTime: null,
   rallyStartTime: null,
   manualHeightUntil: 0,
   manualSpeedUntil: 0,
@@ -246,6 +248,14 @@ const state = {
   bg: { h:220, s:25, l:8 },
   events: [],   // transient visual events: ripples / flashes
   lastImpactPoint: null,
+  // drop / collapse-to-floor animation
+  dropActive: false,
+  dropStart: 0,
+  // hue sweep: color moves through a gradient from one player's hue to the next on contact
+  transitionActive: false,
+  transitionFromHue: 0,
+  transitionStart: 0,
+  transitionDuration: 1.1,
 };
 
 function currentPlayer(){ return PLAYERS[state.activePlayer % PLAYERS.length]; }
@@ -256,8 +266,19 @@ function logEvent(msg){
 }
 
 function markActivity(){
-  state.lastActivityTime = nowSec();
+  const t = nowSec();
+  state.lastActivityTime = t;
+  state.lastMotionTime = t;
   state.idle = false;
+}
+
+function easeInOutCubic(x){ return x<0.5 ? 4*x*x*x : 1-Math.pow(-2*x+2,3)/2; }
+
+function beginHueTransition(fromHue){
+  state.transitionFromHue = fromHue;
+  state.transitionActive = true;
+  state.transitionStart = nowSec();
+  state.transitionDuration = rand(0.9,1.4);
 }
 
 /* =========================================================================================
@@ -288,9 +309,6 @@ function addRipple(x,y,color,maxR,width){
 function addFlash(color, strength){
   state.events.push({ type:'flash', color, alpha: clamp(strength,0,1), born:nowSec() });
 }
-function addCollapse(x,y,color){
-  state.events.push({ type:'collapse', x, y, color, alpha:1, r:Math.max(W,H)*0.42, born:nowSec() });
-}
 
 let pulsePhase = 0;
 let lastFrame = nowSec();
@@ -300,9 +318,13 @@ function render(){
   const dt = clamp(t-lastFrame, 0, 0.05);
   lastFrame = t;
 
-  // ---- idle detection (based on activity + speed) ----
-  const idleTimeout = 4.0;
-  if (!state.running && (t - state.lastActivityTime) > idleTimeout && state.speed < 0.04){
+  // ---- idle detection: recognize when the ball is not actually moving, regardless of
+  //      rally/camera mode, and return to the calm orb. Speed above threshold (real motion,
+  //      simulated motion, or camera-tracked motion) continually pushes this back. ----
+  const idleTimeout = 3.0;
+  const stillnessThreshold = 0.035;
+  if (state.speed > stillnessThreshold) state.lastMotionTime = t;
+  if (!state.dropActive && (t - state.lastMotionTime) > idleTimeout && state.speed < stillnessThreshold){
     state.idle = true;
   }
 
@@ -313,9 +335,17 @@ function render(){
 
   // ---- compute target fg/bg color ----
   const p = currentPlayer();
+  // when the ball just left one player's hand for another's, sweep the hue through the
+  // gradient between the two players' colors rather than snapping straight to the new one
+  let hueNow = p.hue;
+  if (state.transitionActive){
+    const k = clamp((t-state.transitionStart)/state.transitionDuration, 0, 1);
+    hueNow = lerpHue(state.transitionFromHue, p.hue, easeInOutCubic(k));
+    if (k >= 1) state.transitionActive = false;
+  }
   const tone = heightToTone(state.height);
-  const targetFg = { h:p.hue, s: clamp(p.baseSat*0.4 + tone.sat*0.6,0,100), l: tone.light };
-  const targetBg = { h:p.hue, s: lerp(20,55,state.activityLevel), l: lerp(6,16,state.activityLevel) };
+  const targetFg = { h:hueNow, s: clamp(p.baseSat*0.4 + tone.sat*0.6,0,100), l: tone.light };
+  const targetBg = { h:hueNow, s: lerp(24,60,state.activityLevel), l: clamp(lerp(10,22,state.activityLevel)+lerp(-3,8,state.height),4,60) };
 
   const colorLerpRate = 1 - Math.exp(-(lerp(0.6,4.2,state.speed))*dt);
   const bgLerpRate = 1 - Math.exp(-0.5*dt);
@@ -334,6 +364,7 @@ function render(){
     0,1);
   state.activityLevel = lerp(state.activityLevel, targetActivity, 1-Math.exp(-0.8*dt));
 
+  dt_global = dt;
   draw(t,dt);
   updateAudio(dt);
   requestAnimationFrame(render);
@@ -342,7 +373,9 @@ function render(){
 function draw(t,dt){
   ctx.clearRect(0,0,W,H);
 
-  if (state.idle){
+  if (state.dropActive){
+    drawDropCollapse(t);
+  } else if (state.idle){
     drawIdleOrb(t);
   } else {
     drawField(t);
@@ -379,46 +412,80 @@ function drawIdleOrb(t){
 }
 
 function drawField(t){
-  // background: soft organic gradient flowing toward active player's hue
-  const bg1 = hsl(state.bg.h, state.bg.s, state.bg.l+4);
-  const bg2 = hsl(lerpHue(state.bg.h,state.bg.h+40,0.5), state.bg.s*0.7, Math.max(state.bg.l-4,2));
-  const ang = t*0.03;
-  const cx = W/2 + Math.cos(ang)*W*0.15;
-  const cy = H/2 + Math.sin(ang*0.8)*H*0.15;
-  const g = ctx.createRadialGradient(cx,cy,0, W/2,H/2, Math.max(W,H)*0.85);
-  g.addColorStop(0, bg1);
-  g.addColorStop(1, bg2);
+  const diag = Math.hypot(W,H);
+  const core = state.fg;   // height-driven tone: pale/soft (low ball) -> dark/rich (high ball)
+  const edge = state.bg;   // activity-driven ambient tone, same hue family
+
+  // 1) full-bleed wash: the player's color fills the entire screen, corner to corner —
+  //    the gradient runs core -> edge but never fades to black, so there's no vignette.
+  const ang = t*0.025;
+  const cx = W/2 + Math.cos(ang)*W*0.12;
+  const cy = H/2 + Math.sin(ang*0.8)*H*0.12;
+  const g = ctx.createRadialGradient(cx,cy,0, W/2,H/2, diag*0.72);
+  g.addColorStop(0,   hsl(core.h, core.s, core.l));
+  g.addColorStop(0.55,hsl(lerpHue(core.h,edge.h,0.5), lerp(core.s,edge.s,0.6), lerp(core.l,edge.l,0.6)));
+  g.addColorStop(1,   hsl(edge.h, edge.s, edge.l));
   ctx.fillStyle = g;
   ctx.fillRect(0,0,W,H);
 
-  // foreground energy blob: color + pulsation driven by speed
+  // 2) slow drifting organic "flow" blobs layered on top for fluid, living texture —
+  //    large enough to always cover the full screen, never leaving flat dead space.
+  for (let i=0;i<3;i++){
+    const a = t*0.05 + i*(Math.PI*2/3);
+    const bx = W/2 + Math.cos(a*0.7+i)*W*0.35;
+    const by = H/2 + Math.sin(a*0.9+i*1.3)*H*0.35;
+    const br = diag * lerp(0.35,0.55, (Math.sin(t*0.1+i)+1)/2);
+    const bh = lerpHue(core.h, core.h + (i-1)*16, 0.5);
+    const grad = ctx.createRadialGradient(bx,by,0,bx,by,br);
+    grad.addColorStop(0, hsl(bh, core.s*0.9, clamp(core.l+(i-1)*6,4,94), 0.30));
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  // 3) central pulsating energy highlight — the "ball's" presence, pulse rate/size driven by speed
   const pulseHz = lerp(0.25, 2.2, state.speed);
   pulsePhase += dt_global*pulseHz*Math.PI*2;
   const pulse = (Math.sin(pulsePhase)+1)/2;
-  const baseR = lerp(Math.min(W,H)*0.16, Math.min(W,H)*0.30, state.activityLevel);
+  const baseR = lerp(diag*0.14, diag*0.26, state.activityLevel);
   const r = baseR * (0.88 + pulse*lerp(0.06,0.30,state.speed));
+  const hi = ctx.createRadialGradient(W/2,H/2,0, W/2,H/2, r*2.2);
+  hi.addColorStop(0, hsl(core.h, clamp(core.s+5,0,100), clamp(core.l+14,0,97), 0.55));
+  hi.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = hi;
+  ctx.beginPath(); ctx.arc(W/2,H/2, r*2.2, 0, Math.PI*2); ctx.fill();
+}
 
-  const fgColor = hsl(state.fg.h, state.fg.s, state.fg.l, 0.95);
-  const fgColorMid = hsl(state.fg.h, state.fg.s, clamp(state.fg.l+10,0,95), 0.35);
-  const glow = ctx.createRadialGradient(W/2,H/2,0, W/2,H/2, r*2.6);
-  glow.addColorStop(0, fgColor);
-  glow.addColorStop(0.45, fgColorMid);
-  glow.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = glow;
-  ctx.beginPath(); ctx.arc(W/2,H/2, r*2.6, 0, Math.PI*2); ctx.fill();
+function drawDropCollapse(t){
+  // the ball has been dropped: the full-screen color drains downward and collapses
+  // toward the floor, then the scene settles back toward calm as energy fades.
+  const dur = 1.5;
+  const age = t - state.dropStart;
+  const k = clamp(age/dur, 0, 1);
+  const ease = k*k; // accelerating fall, like gravity
 
-  ctx.beginPath();
-  ctx.filter = 'blur(6px)';
-  ctx.fillStyle = fgColor;
-  ctx.arc(W/2,H/2, r, 0, Math.PI*2);
-  ctx.fill();
-  ctx.filter = 'none';
+  ctx.fillStyle = 'rgb(7,8,12)';
+  ctx.fillRect(0,0,W,H);
+
+  const bandTop = lerp(0, H, ease);          // the color band's top edge sinks toward the floor
+  const bandAlpha = clamp(1-ease*0.9, 0, 1);
+  if (bandTop < H){
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, bandTop, W, H-bandTop);
+    ctx.clip();
+    ctx.globalAlpha = bandAlpha;
+    drawField(t);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  if (k >= 1) state.dropActive = false;
 }
 
 let dt_global = 0.016;
 
 function drawEvents(t,dt){
-  dt_global = dt;
   for (let i=state.events.length-1;i>=0;i--){
     const e = state.events[i];
     const age = t - e.born;
@@ -439,25 +506,6 @@ function drawEvents(t,dt){
       ctx.fillRect(0,0,W,H);
       if (e.alpha < 0.01) state.events.splice(i,1);
     }
-    else if (e.type === 'collapse'){
-      // color rapidly fades / collapses toward impact point
-      const dur = 1.3;
-      const k = clamp(age/dur,0,1);
-      e.alpha = 1-k;
-      const rr = lerp(e.r, e.r*0.05, k);
-      const grad = ctx.createRadialGradient(e.x,e.y,0, e.x,e.y, rr);
-      grad.addColorStop(0, e.color.replace(/[\d.]+\)$/g, (e.alpha*0.8).toFixed(3)+')'));
-      grad.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = grad;
-      ctx.beginPath(); ctx.arc(e.x,e.y, rr, 0, Math.PI*2); ctx.fill();
-      // outward ripple accompanying the collapse
-      ctx.beginPath();
-      ctx.strokeStyle = e.color.replace(/[\d.]+\)$/g, (e.alpha*0.5).toFixed(3)+')');
-      ctx.lineWidth = 3;
-      ctx.arc(e.x,e.y, lerp(6,e.r*0.9,k), 0, Math.PI*2);
-      ctx.stroke();
-      if (age > dur) state.events.splice(i,1);
-    }
   }
 }
 
@@ -465,10 +513,18 @@ function drawEvents(t,dt){
    EVENT TRIGGERS  (shared by dev-panel + camera CV heuristics)
    ========================================================================================= */
 function triggerContact(playerIdx){
-  if (playerIdx !== undefined) state.activePlayer = playerIdx % state.numPlayers;
+  const prevHue = currentPlayer().hue;
+  if (playerIdx !== undefined){
+    const newIdx = playerIdx % state.numPlayers;
+    // the ball just left the previous player's hand — sweep the color through the
+    // gradient toward the next player's color rather than snapping to it instantly
+    if (newIdx !== state.activePlayer) beginHueTransition(prevHue);
+    state.activePlayer = newIdx;
+  }
   markActivity();
   state.interactionTimes.push(nowSec());
   state.interactionTimes = state.interactionTimes.filter(x=>nowSec()-x<20);
+  state.lastContactTime = nowSec();
   const p = currentPlayer();
   addFlash(hsl(p.hue,90,60,1), 0.35);
   addRipple(W/2, H/2, hsl(p.hue,90,60,1), Math.max(W,H)*0.5, 5);
@@ -481,11 +537,14 @@ function triggerWallHit(){
   markActivity();
   const p = currentPlayer();
   const intensity = clamp(0.4 + state.speed*0.8, 0.2, 1);
-  const edgeX = Math.random()<0.5 ? W*0.06 : W*0.94;
-  const edgeY = lerp(H*0.8, H*0.15, state.height);
-  addFlash(hsl(p.hue,95,65,1), 0.25*intensity+0.15);
-  addRipple(edgeX, edgeY, hsl(p.hue,95,65,1), lerp(W*0.25,W*0.6,intensity), 3+intensity*6);
-  // brief energetic spike
+  const edgeX = Math.random()<0.5 ? W*0.04 : W*0.96;
+  const edgeY = lerp(H*0.82, H*0.12, state.height);
+  // near-white ripple so it reads clearly against the now-full-screen player color
+  const rippleColor = hsl(p.hue, 25, 96, 1);
+  addFlash(hsl(p.hue,95,70,1), 0.22*intensity+0.12);
+  addRipple(edgeX, edgeY, rippleColor, lerp(W*0.4,W*0.9,intensity), 3+intensity*7);
+  setTimeout(()=> addRipple(edgeX, edgeY, rippleColor, lerp(W*0.28,W*0.65,intensity), 2+intensity*4), 130);
+  // brief energetic spike, echoing the force of the impact
   state.speedTarget = clamp(state.speed + intensity*0.4, 0, 1);
   setTimeout(()=>{ state.speedTarget = clamp(state.speedTarget*0.5,0,1); }, 350);
   playHit(p, true, intensity);
@@ -496,13 +555,14 @@ function triggerDrop(){
   markActivity();
   const p = currentPlayer();
   const x = state.lastImpactPoint ? state.lastImpactPoint.x : W/2;
-  const y = state.lastImpactPoint ? state.lastImpactPoint.y : H*0.82;
-  addCollapse(x,y, hsl(p.hue, 70, 55, 1));
+  addRipple(x, H*0.94, hsl(p.hue, 20, 96, 1), Math.max(W,H)*0.55, 5);
+  state.dropActive = true;
+  state.dropStart = nowSec();
   state.heightTarget = 0.02;
   state.speedTarget = 0.02;
-  state.activityLevel = Math.max(0, state.activityLevel*0.25);
+  state.activityLevel = Math.max(0, state.activityLevel*0.2);
   playDrop(p);
-  logEvent(`Ball dropped — energy fading`);
+  logEvent('Ball dropped — color draining to the floor');
 }
 
 function resetToIdle(){
@@ -513,6 +573,8 @@ function resetToIdle(){
   state.height = 0.05; state.speed = 0.02;
   state.activityLevel = 0;
   state.idle = true;
+  state.dropActive = false;
+  state.transitionActive = false;
   state.events = [];
   document.getElementById('rallyToggleBtn').textContent = 'Start Rally';
   logEvent('Reset to idle');
@@ -540,6 +602,7 @@ function stopRally(){
 }
 function rallyTick(){
   if (!state.running) return;
+  if (state.dropActive) return; // let the collapse animation finish before the next event
   markActivity();
   state.heightTarget = clamp(rand(0.15,0.95),0,1);
   state.speedTarget = clamp(rand(0.25,0.95),0,1);
@@ -670,15 +733,20 @@ const camDot = document.getElementById('camDot');
 const camStatus = document.getElementById('camStatus');
 
 let analysisCanvas = document.createElement('canvas');
-const AW = 96, AH = 72;
+const AW = 110, AH = 82;
 analysisCanvas.width = AW; analysisCanvas.height = AH;
 const actx = analysisCanvas.getContext('2d', { willReadFrequently:true });
 
-let prevCentroid = null;
+let prevCentroid = null;     // raw, normalized 0..1 — used for velocity/direction
+let smoothCentroid = null;   // low-pass filtered — used for height mapping + overlay (less jittery)
 let prevTime = nowSec();
+let prevSpeedNorm = 0;
 let noBlobFrames = 0;
 let cvVerticalSign = 0;
 let cvHorizSign = 0;
+let fallStreak = 0;          // consecutive frames the blob has been descending (gates drop detection)
+let prevGray = null;          // last frame's grayscale, for motion-energy (frame differencing)
+let motionHistory = [];       // rolling {t,m} scene-motion samples — used to confirm "player nearby"
 
 async function startCamera(){
   try{
@@ -695,6 +763,29 @@ async function startCamera(){
   }
 }
 
+// Candidate test: very bright (white) OR strongly saturated (neon) pixel — matches an
+// unmodified white/neon volleyball without needing any marker on the ball itself.
+function isBallPixel(r,g,b,lum){
+  const maxc = Math.max(r,g,b), minc = Math.min(r,g,b);
+  const sat = maxc===0?0:(maxc-minc)/maxc;
+  return lum>195 || (sat>0.55 && maxc>150);
+}
+
+// Scan a region of the (already-drawn) analysis frame for ball-candidate pixels,
+// returning their centroid + count + positional spread (for a compactness check).
+function scanRegion(imgData, x0,y0,x1,y1){
+  let sumX=0,sumY=0,count=0,sqSumX=0,sqSumY=0;
+  for (let y=y0;y<y1;y++){
+    for (let x=x0;x<x1;x++){
+      const i=(y*AW+x)*4;
+      const r=imgData[i], g=imgData[i+1], b=imgData[i+2];
+      const lum = 0.299*r+0.587*g+0.114*b;
+      if (isBallPixel(r,g,b,lum)){ sumX+=x; sumY+=y; count++; sqSumX+=x*x; sqSumY+=y*y; }
+    }
+  }
+  return {sumX,sumY,count,sqSumX,sqSumY};
+}
+
 function analyzeLoop(){
   requestAnimationFrame(analyzeLoop);
   if (camVideo.readyState < 2) return;
@@ -709,72 +800,110 @@ function analyzeLoop(){
   let imgData;
   try{ imgData = actx.getImageData(0,0,AW,AH).data; } catch(e){ return; }
 
-  let sumX=0,sumY=0,count=0;
+  // ---- scene motion-energy via frame differencing (used to tell "ball alone" from
+  //      "a player's hand/arm is moving near it right now") ----
+  const gray = new Float32Array(AW*AH);
+  let motionSum = 0;
   for (let y=0;y<AH;y++){
     for (let x=0;x<AW;x++){
-      const i = (y*AW+x)*4;
-      const r=imgData[i], g=imgData[i+1], b=imgData[i+2];
-      const maxc = Math.max(r,g,b), minc = Math.min(r,g,b);
-      const lum = 0.299*r+0.587*g+0.114*b;
-      const sat = maxc===0?0:(maxc-minc)/maxc;
-      const isCandidate = lum>195 || (sat>0.55 && maxc>150);
-      if (isCandidate){ sumX+=x; sumY+=y; count++; }
+      const idx = y*AW+x, i = idx*4;
+      const lum = 0.299*imgData[i]+0.587*imgData[i+1]+0.114*imgData[i+2];
+      gray[idx] = lum;
+      if (prevGray) motionSum += Math.abs(lum - prevGray[idx]);
     }
+  }
+  const sceneMotion = clamp((motionSum/(AW*AH))/12, 0, 1);
+  const tNowMotion = nowSec();
+  motionHistory.push({t:tNowMotion, m:sceneMotion});
+  motionHistory = motionHistory.filter(e=>tNowMotion-e.t < 0.6);
+  prevGray = gray;
+
+  // ---- ball tracking: search near the last known position first (temporal coherence —
+  //      far fewer jumps to unrelated bright spots elsewhere in frame), re-acquiring over
+  //      the whole frame only when that fails ----
+  let region;
+  if (prevCentroid){
+    const margin = clamp(0.16 + prevSpeedNorm*0.3, 0.16, 0.5);
+    const x0 = Math.floor(clamp(prevCentroid.x-margin,0,1)*AW);
+    const x1 = Math.ceil(clamp(prevCentroid.x+margin,0,1)*AW);
+    const y0 = Math.floor(clamp(prevCentroid.y-margin,0,1)*AH);
+    const y1 = Math.ceil(clamp(prevCentroid.y+margin,0,1)*AH);
+    region = scanRegion(imgData, x0,y0,x1,y1);
+  }
+  if (!region || region.count < 12){
+    region = scanRegion(imgData, 0,0,AW,AH); // lost track — re-acquire over the full frame
   }
 
   camOverlayCtx.clearRect(0,0,camOverlay.width,camOverlay.height);
 
-  const minPixels = 10;
-  if (count > minPixels){
-    noBlobFrames = 0;
-    const cx = (sumX/count)/AW, cy = (sumY/count)/AH; // normalized 0..1
-    const px = cx*camOverlay.width, py = cy*camOverlay.height;
-    const radius = clamp(Math.sqrt(count)/AW * camOverlay.width * 1.4, 6, 60);
+  if (region.count > 12){
+    const cx = (region.sumX/region.count)/AW, cy = (region.sumY/region.count)/AH;
+    // compactness check: reject wide, scattered pixel clouds (background noise / lighting),
+    // which a real round ball blob would never produce
+    const varX = Math.sqrt(Math.max(0, region.sqSumX/region.count - (region.sumX/region.count)**2))/AW;
+    const varY = Math.sqrt(Math.max(0, region.sqSumY/region.count - (region.sumY/region.count)**2))/AH;
+    const compact = varX < 0.22 && varY < 0.22;
 
-    camOverlayCtx.strokeStyle = 'rgba(80,255,160,0.9)';
-    camOverlayCtx.lineWidth = 2;
-    camOverlayCtx.beginPath(); camOverlayCtx.arc(px,py,radius,0,Math.PI*2); camOverlayCtx.stroke();
+    if (compact){
+      noBlobFrames = 0;
+      smoothCentroid = smoothCentroid
+        ? { x: lerp(smoothCentroid.x, cx, 0.45), y: lerp(smoothCentroid.y, cy, 0.45) }
+        : { x: cx, y: cy };
 
-    const tNow = nowSec();
-    const dt = clamp(tNow-prevTime, 0.001, 0.5);
-    if (prevCentroid){
-      const dx = cx-prevCentroid.x, dy = cy-prevCentroid.y;
-      const speedPx = Math.sqrt(dx*dx+dy*dy)/dt;
-      const speedNorm = clamp(speedPx/2.2, 0, 1);
+      const px = smoothCentroid.x*camOverlay.width, py = smoothCentroid.y*camOverlay.height;
+      const radius = clamp(Math.sqrt(region.count)/AW * camOverlay.width * 1.4, 6, 60);
+      camOverlayCtx.strokeStyle = 'rgba(80,255,160,0.9)';
+      camOverlayCtx.lineWidth = 2;
+      camOverlayCtx.beginPath(); camOverlayCtx.arc(px,py,radius,0,Math.PI*2); camOverlayCtx.stroke();
 
-      if (state.cvEnabled){
-        state.heightTarget = clamp(1-cy, 0, 1);
-        state.speedTarget = speedNorm;
-        state.height = lerp(state.height, state.heightTarget, 0.5);
-        markActivity();
-        state.idle = false;
+      const tNow = nowSec();
+      const dt = clamp(tNow-prevTime, 0.001, 0.5);
+      if (prevCentroid){
+        const dx = cx-prevCentroid.x, dy = cy-prevCentroid.y;
+        const speedPx = Math.sqrt(dx*dx+dy*dy)/dt;
+        const speedNorm = clamp(speedPx/2.2, 0, 1);
+        prevSpeedNorm = speedNorm;
 
-        // heuristic event detection from motion reversal
-        const vSign = Math.sign(dy);
-        const hSign = Math.sign(dx);
-        if (vSign !== 0 && cvVerticalSign > 0 && vSign < 0 && speedNorm>0.35){
-          triggerContact(); // was falling, now rising strongly => contact
+        if (state.cvEnabled){
+          state.heightTarget = clamp(1-smoothCentroid.y, 0, 1);
+          state.speedTarget = speedNorm;
+          state.height = lerp(state.height, state.heightTarget, 0.5);
+          markActivity();
+
+          fallStreak = dy > 0 ? fallStreak+1 : 0; // dy>0 == descending (y grows downward)
+
+          // was a hand/arm actually near the ball just now? distinguishes real player
+          // contact from the ball simply reaching the natural apex of its own arc,
+          // and a passive wall bounce from an active player redirect.
+          const recentMotion = motionHistory.reduce((m,e)=>Math.max(m,e.m), 0);
+          const motionNearby = recentMotion > 0.28;
+
+          const vSign = Math.sign(dy), hSign = Math.sign(dx);
+          if (vSign !== 0 && cvVerticalSign > 0 && vSign < 0 && speedNorm > 0.32){
+            if (motionNearby) triggerContact();       // confirmed: a player redirected it
+            // else: unattended apex of the arc — normal ball movement, no event fired
+          } else if (hSign !== 0 && cvHorizSign !== 0 && hSign !== cvHorizSign && speedNorm > 0.45){
+            if (motionNearby) triggerContact(); else triggerWallHit();
+          }
+          if (vSign!==0) cvVerticalSign = vSign;
+          if (hSign!==0) cvHorizSign = hSign;
+          state.lastImpactPoint = { x: smoothCentroid.x*W, y: smoothCentroid.y*H };
         }
-        if (hSign !== 0 && cvHorizSign !== 0 && hSign !== cvHorizSign && speedNorm>0.5){
-          triggerWallHit();
-        }
-        if (vSign!==0) cvVerticalSign = vSign;
-        if (hSign!==0) cvHorizSign = hSign;
-        state.lastImpactPoint = { x: cx*W, y: cy*H };
       }
+      prevCentroid = {x:cx,y:cy};
+      prevTime = tNow;
+    } else {
+      noBlobFrames++;
     }
-    prevCentroid = {x:cx,y:cy};
-    prevTime = tNow;
   } else {
     noBlobFrames++;
-    if (state.cvEnabled && noBlobFrames === 20 && prevCentroid && prevCentroid.y > 0.55){
-      // blob disappeared low in frame after being tracked -> likely dropped/settled
+    if (state.cvEnabled && noBlobFrames === 18 && prevCentroid && prevCentroid.y > 0.5 && fallStreak > 3){
+      // was tracked descending steadily, then vanished low in frame -> dropped/settled
       triggerDrop();
     }
-    if (state.cvEnabled && noBlobFrames > 90){
-      state.idle = true;
+    if (noBlobFrames > 80){
+      prevCentroid = null; smoothCentroid = null; fallStreak = 0;
     }
-    prevCentroid = null;
   }
 }
 
@@ -843,7 +972,7 @@ document.getElementById('speedSlider').addEventListener('input', (e)=>{
   markActivity();
 });
 
-document.getElementById('hitBtn').addEventListener('click', ()=> triggerContact((state.activePlayer+1)%state.numPlayers === state.activePlayer ? state.activePlayer : state.activePlayer));
+document.getElementById('hitBtn').addEventListener('click', ()=> triggerContact(state.activePlayer));
 document.getElementById('dropBtn').addEventListener('click', triggerDrop);
 document.getElementById('wallBtn').addEventListener('click', triggerWallHit);
 document.getElementById('resetBtn').addEventListener('click', resetToIdle);
