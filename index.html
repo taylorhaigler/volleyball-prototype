@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Volleyball Luminous Field</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --panel-bg: rgba(10,12,18,0.55);
+    --panel-border: rgba(255,255,255,0.10);
+    --text: rgba(255,255,255,0.86);
+    --text-dim: rgba(255,255,255,0.45);
+    --accent: rgba(255,255,255,0.9);
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%; overflow:hidden;
+    background:#05060a; color:var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  #stage{
+    position:fixed; inset:0; width:100%; height:100%; display:block;
+  }
+
+  /* ---------- Start overlay (needed for audio + camera permission gesture) ---------- */
+  #startOverlay{
+    position:fixed; inset:0; z-index:100;
+    display:flex; align-items:center; justify-content:center; flex-direction:column; gap:18px;
+    background:radial-gradient(ellipse at center, #12141c 0%, #05060a 75%);
+    transition: opacity 0.8s ease;
+  }
+  #startOverlay.hidden{ opacity:0; pointer-events:none; }
+  #startOverlay h1{
+    font-weight:300; font-size:28px; letter-spacing:0.06em; margin:0; text-align:center;
+    color:rgba(255,255,255,0.92);
+  }
+  #startOverlay p{ color:var(--text-dim); font-size:13px; max-width:420px; text-align:center; line-height:1.6; margin:0; }
+  #beginBtn{
+    padding:14px 38px; border-radius:999px; border:1px solid rgba(255,255,255,0.35);
+    background:rgba(255,255,255,0.06); color:#fff; font-size:15px; letter-spacing:0.04em;
+    cursor:pointer; backdrop-filter:blur(6px); transition: all 0.25s ease;
+  }
+  #beginBtn:hover{ background:rgba(255,255,255,0.16); transform:scale(1.03); }
+
+  /* ---------- Camera debug window (small, corner, unobtrusive) ---------- */
+  #cameraDock{
+    position:fixed; top:16px; left:16px; z-index:20;
+    width:200px; border-radius:12px; overflow:hidden;
+    background:var(--panel-bg); border:1px solid var(--panel-border);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+    opacity:0.85; transition:opacity 0.25s ease;
+  }
+  #cameraDock:hover{ opacity:1; }
+  #cameraDock .label{
+    font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-dim);
+    padding:6px 8px 4px; display:flex; justify-content:space-between; align-items:center;
+  }
+  #cameraDock .dot{ width:6px; height:6px; border-radius:50%; background:#555; box-shadow:0 0 0 rgba(0,0,0,0); }
+  #cameraDock .dot.live{ background:#39ff8a; box-shadow:0 0 6px #39ff8a; }
+  #camWrap{ position:relative; width:100%; aspect-ratio:4/3; background:#000; }
+  #camVideo{ width:100%; height:100%; object-fit:cover; transform:scaleX(-1); display:block; }
+  #camOverlay{ position:absolute; inset:0; width:100%; height:100%; transform:scaleX(-1); }
+  #camStatus{ font-size:10px; color:var(--text-dim); padding:5px 8px 7px; line-height:1.4; }
+
+  /* ---------- Dev / debug panel ---------- */
+  #panelToggle{
+    position:fixed; bottom:16px; right:16px; z-index:30;
+    width:38px; height:38px; border-radius:50%;
+    background:var(--panel-bg); border:1px solid var(--panel-border);
+    color:var(--text); display:flex; align-items:center; justify-content:center;
+    cursor:pointer; font-size:16px; backdrop-filter:blur(10px);
+  }
+  #devPanel{
+    position:fixed; bottom:16px; right:64px; z-index:29;
+    width:300px; max-height:82vh; overflow-y:auto;
+    background:var(--panel-bg); border:1px solid var(--panel-border);
+    border-radius:14px; padding:14px 16px 18px; backdrop-filter: blur(14px);
+    box-shadow:0 10px 40px rgba(0,0,0,0.4);
+    transform:translateX(12px) scale(0.98); opacity:0; pointer-events:none;
+    transition: all 0.22s ease;
+  }
+  #devPanel.open{ transform:none; opacity:1; pointer-events:auto; }
+  #devPanel h2{
+    font-size:11px; text-transform:uppercase; letter-spacing:0.14em; color:var(--text-dim);
+    margin:14px 0 8px; font-weight:600;
+  }
+  #devPanel h2:first-child{ margin-top:0; }
+  .row{ display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .row label{ font-size:11px; color:var(--text-dim); width:78px; flex-shrink:0; }
+  .row input[type=range]{ flex:1; accent-color:#ffffff; }
+  .row .val{ font-size:10px; width:32px; text-align:right; color:var(--text-dim); }
+  .btnrow{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .btn{
+    flex:1; min-width:60px; padding:8px 6px; border-radius:8px; border:1px solid rgba(255,255,255,0.15);
+    background:rgba(255,255,255,0.05); color:var(--text); font-size:11px; cursor:pointer; text-align:center;
+    transition: background 0.15s ease;
+  }
+  .btn:hover{ background:rgba(255,255,255,0.14); }
+  .btn.primary{ background:rgba(255,255,255,0.12); font-weight:600; }
+  .btn.active{ outline:2px solid rgba(255,255,255,0.7); }
+  .playerBtn{ position:relative; }
+  .playerBtn .swatch{
+    display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px;
+    box-shadow:0 0 5px currentColor;
+  }
+  .toggleRow{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .toggleRow label{ font-size:11px; color:var(--text-dim); }
+  .switch{ position:relative; width:34px; height:18px; }
+  .switch input{ opacity:0; width:0; height:0; }
+  .slider2{ position:absolute; inset:0; background:rgba(255,255,255,0.15); border-radius:20px; cursor:pointer; transition:0.2s; }
+  .slider2:before{ content:""; position:absolute; width:14px; height:14px; left:2px; top:2px; background:#fff; border-radius:50%; transition:0.2s; }
+  .switch input:checked + .slider2{ background:rgba(120,220,255,0.55); }
+  .switch input:checked + .slider2:before{ transform:translateX(16px); }
+  .stepper{ display:flex; align-items:center; gap:8px; }
+  .stepper button{
+    width:26px; height:26px; border-radius:6px; border:1px solid rgba(255,255,255,0.15);
+    background:rgba(255,255,255,0.05); color:#fff; cursor:pointer; font-size:14px;
+  }
+  #eventLog{
+    font-size:10px; color:var(--text-dim); margin-top:10px; padding-top:10px;
+    border-top:1px solid var(--panel-border); line-height:1.5; min-height:32px;
+  }
+  #eventLog b{ color:var(--text); font-weight:500; }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+
+<!-- Camera debug window: small, corner, non-dominant -->
+<div id="cameraDock">
+  <div class="label"><span>CV Debug</span><span class="dot" id="camDot"></span></div>
+  <div id="camWrap">
+    <video id="camVideo" autoplay playsinline muted></video>
+    <canvas id="camOverlay"></canvas>
+  </div>
+  <div id="camStatus">Camera not started</div>
+</div>
+
+<!-- Dev / debug controls -->
+<div id="panelToggle">⚙</div>
+<div id="devPanel">
+
+  <h2>Sensing</h2>
+  <div class="toggleRow">
+    <label>Use camera tracking</label>
+    <label class="switch"><input type="checkbox" id="cvToggle"><span class="slider2"></span></label>
+  </div>
+  <div class="toggleRow">
+    <label>Simulated IR gate</label>
+    <label class="switch"><input type="checkbox" id="irToggle"><span class="slider2"></span></label>
+  </div>
+
+  <h2>Rally</h2>
+  <div class="btnrow">
+    <button class="btn primary" id="rallyToggleBtn">Start Rally</button>
+    <button class="btn" id="resetBtn">Reset to Idle</button>
+  </div>
+  <div class="row">
+    <label>Players</label>
+    <div class="stepper">
+      <button id="npDown">–</button>
+      <span id="npVal" style="width:14px;text-align:center;">2</span>
+      <button id="npUp">+</button>
+    </div>
+  </div>
+  <div id="playerButtons" class="btnrow"></div>
+
+  <h2>Ball state (manual)</h2>
+  <div class="row">
+    <label>Height</label>
+    <input type="range" id="heightSlider" min="0" max="100" value="10">
+    <span class="val" id="heightVal">10</span>
+  </div>
+  <div class="row">
+    <label>Speed</label>
+    <input type="range" id="speedSlider" min="0" max="100" value="5">
+    <span class="val" id="speedVal">5</span>
+  </div>
+
+  <h2>Simulate events</h2>
+  <div class="btnrow">
+    <button class="btn" id="hitBtn">Contact / Hit</button>
+    <button class="btn" id="dropBtn">Ball Dropped</button>
+    <button class="btn" id="wallBtn">Wall Hit</button>
+  </div>
+
+  <div id="eventLog">Waiting…</div>
+</div>
+
+<div id="startOverlay">
+  <h1>Volleyball Luminous Field</h1>
+  <p>A camera-driven, sound-and-light instrument. Movement of the ball becomes color; contact becomes music.
+     Click begin to enable audio and (optionally) the camera.</p>
+  <button id="beginBtn">Begin Experience</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* =========================================================================================
+   CONFIG / PLAYER DEFINITIONS
+   ========================================================================================= */
+const PLAYERS = [
+  { name:"Player 1", hue:330, baseSat:80 }, // pink
+  { name:"Player 2", hue:206, baseSat:85 }, // blue
+  { name:"Player 3", hue:145, baseSat:70 }, // green
+  { name:"Player 4", hue:28,  baseSat:92 }, // orange
+];
+
+function hsl(h,s,l,a){ a = (a===undefined)?1:a; return `hsla(${h.toFixed(1)},${s.toFixed(1)}%,${l.toFixed(1)}%,${a})`; }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+function lerpHue(a,b,t){
+  let d = ((b-a+540)%360)-180;
+  return (a + d*t + 360)%360;
+}
+function nowSec(){ return performance.now()/1000; }
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+/* =========================================================================================
+   STATE
+   ========================================================================================= */
+const state = {
+  numPlayers: 2,
+  activePlayer: 0,
+  height: 0.1,      // 0..1  (0 = ball low, 1 = ball high)
+  speed: 0.05,      // 0..1  (0 = still, 1 = fast)
+  heightTarget: 0.1,
+  speedTarget: 0.05,
+  running: false,          // auto rally demo running
+  idle: true,
+  lastActivityTime: nowSec(),
+  cvEnabled: false,
+  irEnabled: false,
+  activityLevel: 0,        // smoothed 0..1, drives audio
+  interactionTimes: [],    // timestamps of recent contacts, for "frequency"
+  rallyStartTime: null,
+  manualHeightUntil: 0,
+  manualSpeedUntil: 0,
+  // smoothed visual color state
+  fg: { h:0, s:20, l:88 },
+  bg: { h:220, s:25, l:8 },
+  events: [],   // transient visual events: ripples / flashes
+  lastImpactPoint: null,
+};
+
+function currentPlayer(){ return PLAYERS[state.activePlayer % PLAYERS.length]; }
+
+function logEvent(msg){
+  const el = document.getElementById('eventLog');
+  el.innerHTML = `<b>${msg}</b>`;
+}
+
+function markActivity(){
+  state.lastActivityTime = nowSec();
+  state.idle = false;
+}
+
+/* =========================================================================================
+   CANVAS / VISUAL ENGINE
+   ========================================================================================= */
+const stage = document.getElementById('stage');
+const ctx = stage.getContext('2d');
+let W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
+function resize(){
+  W = window.innerWidth; H = window.innerHeight;
+  stage.width = W*DPR; stage.height = H*DPR;
+  stage.style.width = W+'px'; stage.style.height = H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function heightToTone(height){
+  // low height -> pale & soft; high height -> dark & rich/saturated
+  const light = lerp(86, 34, height);
+  const sat   = lerp(35, 92, height);
+  return { light, sat };
+}
+
+function addRipple(x,y,color,maxR,width){
+  state.events.push({ type:'ripple', x, y, r:8, maxR, alpha:1, color, width: width||6, born:nowSec() });
+}
+function addFlash(color, strength){
+  state.events.push({ type:'flash', color, alpha: clamp(strength,0,1), born:nowSec() });
+}
+function addCollapse(x,y,color){
+  state.events.push({ type:'collapse', x, y, color, alpha:1, r:Math.max(W,H)*0.42, born:nowSec() });
+}
+
+let pulsePhase = 0;
+let lastFrame = nowSec();
+
+function render(){
+  const t = nowSec();
+  const dt = clamp(t-lastFrame, 0, 0.05);
+  lastFrame = t;
+
+  // ---- idle detection (based on activity + speed) ----
+  const idleTimeout = 4.0;
+  if (!state.running && (t - state.lastActivityTime) > idleTimeout && state.speed < 0.04){
+    state.idle = true;
+  }
+
+  // ---- drift height/speed toward targets (organic glide) ----
+  const glideRate = 1 - Math.exp(-1.4*dt);
+  if (t > state.manualHeightUntil) state.height = lerp(state.height, state.heightTarget, glideRate);
+  if (t > state.manualSpeedUntil)  state.speed  = lerp(state.speed,  state.speedTarget,  glideRate);
+
+  // ---- compute target fg/bg color ----
+  const p = currentPlayer();
+  const tone = heightToTone(state.height);
+  const targetFg = { h:p.hue, s: clamp(p.baseSat*0.4 + tone.sat*0.6,0,100), l: tone.light };
+  const targetBg = { h:p.hue, s: lerp(20,55,state.activityLevel), l: lerp(6,16,state.activityLevel) };
+
+  const colorLerpRate = 1 - Math.exp(-(lerp(0.6,4.2,state.speed))*dt);
+  const bgLerpRate = 1 - Math.exp(-0.5*dt);
+  state.fg.h = lerpHue(state.fg.h, targetFg.h, colorLerpRate);
+  state.fg.s = lerp(state.fg.s, targetFg.s, colorLerpRate);
+  state.fg.l = lerp(state.fg.l, targetFg.l, colorLerpRate);
+  state.bg.h = lerpHue(state.bg.h, targetBg.h, bgLerpRate);
+  state.bg.s = lerp(state.bg.s, targetBg.s, bgLerpRate);
+  state.bg.l = lerp(state.bg.l, targetBg.l, bgLerpRate);
+
+  // ---- activity level (drives audio + bg richness) ----
+  const recentInteractions = state.interactionTimes.filter(x=>t-x<8).length;
+  const rallyDur = state.rallyStartTime? clamp((t-state.rallyStartTime)/40,0,1) : 0;
+  const targetActivity = state.idle ? 0 : clamp(
+    state.speed*0.45 + (state.numPlayers/4)*0.25 + clamp(recentInteractions/6,0,1)*0.2 + rallyDur*0.1,
+    0,1);
+  state.activityLevel = lerp(state.activityLevel, targetActivity, 1-Math.exp(-0.8*dt));
+
+  draw(t,dt);
+  updateAudio(dt);
+  requestAnimationFrame(render);
+}
+
+function draw(t,dt){
+  ctx.clearRect(0,0,W,H);
+
+  if (state.idle){
+    drawIdleOrb(t);
+  } else {
+    drawField(t);
+  }
+
+  drawEvents(t,dt);
+}
+
+function drawIdleOrb(t){
+  // deep calm background
+  const g = ctx.createRadialGradient(W/2,H/2, 0, W/2,H/2, Math.max(W,H)*0.75);
+  g.addColorStop(0, 'rgba(18,20,28,1)');
+  g.addColorStop(1, 'rgba(4,5,9,1)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  const breathe = (Math.sin(t*0.55)+1)/2; // slow breathing 0..1
+  const baseR = Math.min(W,H)*0.10;
+  const r = baseR * (0.85 + breathe*0.3);
+
+  const glow = ctx.createRadialGradient(W/2,H/2,0, W/2,H/2, r*3.6);
+  glow.addColorStop(0, `rgba(255,255,255,${0.55+breathe*0.25})`);
+  glow.addColorStop(0.35, `rgba(255,255,255,${0.18+breathe*0.08})`);
+  glow.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(W/2,H/2, r*3.6, 0, Math.PI*2); ctx.fill();
+
+  ctx.beginPath();
+  ctx.fillStyle = `rgba(255,255,255,${0.85+breathe*0.15})`;
+  ctx.filter = 'blur(2px)';
+  ctx.arc(W/2,H/2,r,0,Math.PI*2);
+  ctx.fill();
+  ctx.filter = 'none';
+}
+
+function drawField(t){
+  // background: soft organic gradient flowing toward active player's hue
+  const bg1 = hsl(state.bg.h, state.bg.s, state.bg.l+4);
+  const bg2 = hsl(lerpHue(state.bg.h,state.bg.h+40,0.5), state.bg.s*0.7, Math.max(state.bg.l-4,2));
+  const ang = t*0.03;
+  const cx = W/2 + Math.cos(ang)*W*0.15;
+  const cy = H/2 + Math.sin(ang*0.8)*H*0.15;
+  const g = ctx.createRadialGradient(cx,cy,0, W/2,H/2, Math.max(W,H)*0.85);
+  g.addColorStop(0, bg1);
+  g.addColorStop(1, bg2);
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // foreground energy blob: color + pulsation driven by speed
+  const pulseHz = lerp(0.25, 2.2, state.speed);
+  pulsePhase += dt_global*pulseHz*Math.PI*2;
+  const pulse = (Math.sin(pulsePhase)+1)/2;
+  const baseR = lerp(Math.min(W,H)*0.16, Math.min(W,H)*0.30, state.activityLevel);
+  const r = baseR * (0.88 + pulse*lerp(0.06,0.30,state.speed));
+
+  const fgColor = hsl(state.fg.h, state.fg.s, state.fg.l, 0.95);
+  const fgColorMid = hsl(state.fg.h, state.fg.s, clamp(state.fg.l+10,0,95), 0.35);
+  const glow = ctx.createRadialGradient(W/2,H/2,0, W/2,H/2, r*2.6);
+  glow.addColorStop(0, fgColor);
+  glow.addColorStop(0.45, fgColorMid);
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(W/2,H/2, r*2.6, 0, Math.PI*2); ctx.fill();
+
+  ctx.beginPath();
+  ctx.filter = 'blur(6px)';
+  ctx.fillStyle = fgColor;
+  ctx.arc(W/2,H/2, r, 0, Math.PI*2);
+  ctx.fill();
+  ctx.filter = 'none';
+}
+
+let dt_global = 0.016;
+
+function drawEvents(t,dt){
+  dt_global = dt;
+  for (let i=state.events.length-1;i>=0;i--){
+    const e = state.events[i];
+    const age = t - e.born;
+
+    if (e.type === 'ripple'){
+      e.r = lerp(8, e.maxR, clamp(age/0.9,0,1));
+      e.alpha = clamp(1 - age/0.9, 0, 1);
+      ctx.beginPath();
+      ctx.strokeStyle = e.color.replace(/[\d.]+\)$/g, (e.alpha*0.9).toFixed(3)+')');
+      ctx.lineWidth = e.width * (1-age/0.9<0?0:1);
+      ctx.arc(e.x, e.y, e.r, 0, Math.PI*2);
+      ctx.stroke();
+      if (age > 0.9) state.events.splice(i,1);
+    }
+    else if (e.type === 'flash'){
+      e.alpha = e.alpha * Math.exp(-dt*6);
+      ctx.fillStyle = e.color.replace(/[\d.]+\)$/g, (e.alpha).toFixed(3)+')');
+      ctx.fillRect(0,0,W,H);
+      if (e.alpha < 0.01) state.events.splice(i,1);
+    }
+    else if (e.type === 'collapse'){
+      // color rapidly fades / collapses toward impact point
+      const dur = 1.3;
+      const k = clamp(age/dur,0,1);
+      e.alpha = 1-k;
+      const rr = lerp(e.r, e.r*0.05, k);
+      const grad = ctx.createRadialGradient(e.x,e.y,0, e.x,e.y, rr);
+      grad.addColorStop(0, e.color.replace(/[\d.]+\)$/g, (e.alpha*0.8).toFixed(3)+')'));
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(e.x,e.y, rr, 0, Math.PI*2); ctx.fill();
+      // outward ripple accompanying the collapse
+      ctx.beginPath();
+      ctx.strokeStyle = e.color.replace(/[\d.]+\)$/g, (e.alpha*0.5).toFixed(3)+')');
+      ctx.lineWidth = 3;
+      ctx.arc(e.x,e.y, lerp(6,e.r*0.9,k), 0, Math.PI*2);
+      ctx.stroke();
+      if (age > dur) state.events.splice(i,1);
+    }
+  }
+}
+
+/* =========================================================================================
+   EVENT TRIGGERS  (shared by dev-panel + camera CV heuristics)
+   ========================================================================================= */
+function triggerContact(playerIdx){
+  if (playerIdx !== undefined) state.activePlayer = playerIdx % state.numPlayers;
+  markActivity();
+  state.interactionTimes.push(nowSec());
+  state.interactionTimes = state.interactionTimes.filter(x=>nowSec()-x<20);
+  const p = currentPlayer();
+  addFlash(hsl(p.hue,90,60,1), 0.35);
+  addRipple(W/2, H/2, hsl(p.hue,90,60,1), Math.max(W,H)*0.5, 5);
+  playHit(p, false);
+  renderPlayerButtons();
+  logEvent(`${p.name} — contact`);
+}
+
+function triggerWallHit(){
+  markActivity();
+  const p = currentPlayer();
+  const intensity = clamp(0.4 + state.speed*0.8, 0.2, 1);
+  const edgeX = Math.random()<0.5 ? W*0.06 : W*0.94;
+  const edgeY = lerp(H*0.8, H*0.15, state.height);
+  addFlash(hsl(p.hue,95,65,1), 0.25*intensity+0.15);
+  addRipple(edgeX, edgeY, hsl(p.hue,95,65,1), lerp(W*0.25,W*0.6,intensity), 3+intensity*6);
+  // brief energetic spike
+  state.speedTarget = clamp(state.speed + intensity*0.4, 0, 1);
+  setTimeout(()=>{ state.speedTarget = clamp(state.speedTarget*0.5,0,1); }, 350);
+  playHit(p, true, intensity);
+  logEvent(`Wall hit — ${(intensity*100).toFixed(0)}% force`);
+}
+
+function triggerDrop(){
+  markActivity();
+  const p = currentPlayer();
+  const x = state.lastImpactPoint ? state.lastImpactPoint.x : W/2;
+  const y = state.lastImpactPoint ? state.lastImpactPoint.y : H*0.82;
+  addCollapse(x,y, hsl(p.hue, 70, 55, 1));
+  state.heightTarget = 0.02;
+  state.speedTarget = 0.02;
+  state.activityLevel = Math.max(0, state.activityLevel*0.25);
+  playDrop(p);
+  logEvent(`Ball dropped — energy fading`);
+}
+
+function resetToIdle(){
+  state.running = false;
+  state.rallyStartTime = null;
+  state.heightTarget = 0.05;
+  state.speedTarget = 0.02;
+  state.height = 0.05; state.speed = 0.02;
+  state.activityLevel = 0;
+  state.idle = true;
+  state.events = [];
+  document.getElementById('rallyToggleBtn').textContent = 'Start Rally';
+  logEvent('Reset to idle');
+}
+
+/* =========================================================================================
+   AUTO RALLY (organic simulated demo, drives height/speed/events on its own)
+   ========================================================================================= */
+let rallyTimer = null;
+function startRally(){
+  state.running = true;
+  state.idle = false;
+  state.rallyStartTime = nowSec();
+  markActivity();
+  document.getElementById('rallyToggleBtn').textContent = 'Stop Rally';
+  logEvent('Rally started');
+  rallyTick();
+  rallyTimer = setInterval(rallyTick, rand(650,1100));
+}
+function stopRally(){
+  state.running = false;
+  clearInterval(rallyTimer);
+  document.getElementById('rallyToggleBtn').textContent = 'Start Rally';
+  logEvent('Rally stopped');
+}
+function rallyTick(){
+  if (!state.running) return;
+  markActivity();
+  state.heightTarget = clamp(rand(0.15,0.95),0,1);
+  state.speedTarget = clamp(rand(0.25,0.95),0,1);
+  const roll = Math.random();
+  if (roll < 0.62){
+    triggerContact(Math.floor(Math.random()*state.numPlayers));
+  } else if (roll < 0.85){
+    triggerWallHit();
+  } else if (roll < 0.92){
+    // brief drop mid-rally, then recovers (organic wobble, not game-ending)
+    triggerDrop();
+  }
+  clearInterval(rallyTimer);
+  rallyTimer = setInterval(rallyTick, rand(650,1200));
+}
+
+/* =========================================================================================
+   AUDIO ENGINE
+   ========================================================================================= */
+let audioCtx=null, master=null;
+let droneOsc1=null, droneOsc2=null, droneFilter=null, droneGain=null;
+let noiseSrc=null, noiseFilter=null, noiseGain=null;
+let padOsc=null, padGain=null;
+let audioReady = false;
+
+function initAudio(){
+  if (audioReady) return;
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  master = audioCtx.createGain(); master.gain.value = 0.7; master.connect(audioCtx.destination);
+
+  // --- calm drone base (always present, gentle) ---
+  droneOsc1 = audioCtx.createOscillator(); droneOsc1.type='sine'; droneOsc1.frequency.value = 82;
+  droneOsc2 = audioCtx.createOscillator(); droneOsc2.type='sine'; droneOsc2.frequency.value = 82*1.5;
+  droneFilter = audioCtx.createBiquadFilter(); droneFilter.type='lowpass'; droneFilter.frequency.value = 400;
+  droneGain = audioCtx.createGain(); droneGain.gain.value = 0.0001;
+  droneOsc1.connect(droneFilter); droneOsc2.connect(droneFilter);
+  droneFilter.connect(droneGain); droneGain.connect(master);
+  droneOsc1.start(); droneOsc2.start();
+
+  // --- energetic layer: filtered noise bed, fades in with activity ---
+  const bufferSize = audioCtx.sampleRate*2;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i=0;i<bufferSize;i++) data[i] = (Math.random()*2-1)*0.6;
+  noiseSrc = audioCtx.createBufferSource(); noiseSrc.buffer = buffer; noiseSrc.loop = true;
+  noiseFilter = audioCtx.createBiquadFilter(); noiseFilter.type='bandpass'; noiseFilter.frequency.value=900; noiseFilter.Q.value=0.7;
+  noiseGain = audioCtx.createGain(); noiseGain.gain.value = 0.0001;
+  noiseSrc.connect(noiseFilter); noiseFilter.connect(noiseGain); noiseGain.connect(master);
+  noiseSrc.start();
+
+  // --- inspirational pad layer, fades in with sustained rally / more players ---
+  padOsc = audioCtx.createOscillator(); padOsc.type='triangle'; padOsc.frequency.value = 82*2.003;
+  padGain = audioCtx.createGain(); padGain.gain.value = 0.0001;
+  padOsc.connect(padGain); padGain.connect(master);
+  padOsc.start();
+
+  audioReady = true;
+}
+
+function updateAudio(dt){
+  if (!audioReady) return;
+  const t = audioCtx.currentTime;
+  const act = state.activityLevel; // 0..1
+  const p = currentPlayer();
+
+  // drone: always audible, a little richer with activity
+  const droneTarget = state.idle ? 0.05 : lerp(0.09, 0.16, act);
+  droneGain.gain.setTargetAtTime(droneTarget, t, 0.9);
+  droneFilter.frequency.setTargetAtTime(lerp(260, 1100, act), t, 1.2);
+  const rootFreq = 60 + p.hue*0.12; // subtle timbral shift per active player
+  droneOsc1.frequency.setTargetAtTime(rootFreq, t, 1.5);
+  droneOsc2.frequency.setTargetAtTime(rootFreq*1.5, t, 1.5);
+
+  // energetic noise bed: only present at higher activity
+  const noiseTarget = state.idle ? 0 : Math.pow(clamp(act,0,1),1.6)*0.10;
+  noiseGain.gain.setTargetAtTime(noiseTarget, t, 0.8);
+  noiseFilter.frequency.setTargetAtTime(lerp(500,3200,act), t, 1.0);
+
+  // pad: sustained rally + multiple players = expansive layered feel
+  const rallyBoost = state.rallyStartTime ? clamp((nowSec()-state.rallyStartTime)/25,0,1) : 0;
+  const padTarget = state.idle ? 0 : clamp(act*0.6 + (state.numPlayers-1)/3*0.3 + rallyBoost*0.2,0,1)*0.09;
+  padGain.gain.setTargetAtTime(padTarget, t, 1.4);
+  padOsc.frequency.setTargetAtTime(rootFreq*2.003, t, 1.4);
+
+  master.gain.setTargetAtTime(state.idle?0.35:0.7, t, 1.0);
+}
+
+function playHit(player, hard, intensity){
+  if (!audioReady) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = hard? 'square':'sine';
+  const freq = 220 + player.hue*0.8 + (hard? 120:0);
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(freq*0.5,40), t+ (hard?0.18:0.28));
+  const peak = clamp((intensity!==undefined?intensity:0.5)*0.5 + 0.12, 0.05, 0.6);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + (hard?0.28:0.4));
+  const filt = audioCtx.createBiquadFilter(); filt.type='lowpass'; filt.frequency.value = hard?2200:1400;
+  o.connect(filt); filt.connect(g); g.connect(master);
+  o.start(t); o.stop(t + 0.5);
+}
+
+function playDrop(player){
+  if (!audioReady) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(160, t);
+  o.frequency.exponentialRampToValueAtTime(45, t+0.6);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.32, t+0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+0.9);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t+1.0);
+}
+
+/* =========================================================================================
+   CAMERA + LIGHTWEIGHT COMPUTER VISION (best-effort blob tracking)
+   ========================================================================================= */
+const camVideo = document.getElementById('camVideo');
+const camOverlay = document.getElementById('camOverlay');
+const camOverlayCtx = camOverlay.getContext('2d');
+const camDot = document.getElementById('camDot');
+const camStatus = document.getElementById('camStatus');
+
+let analysisCanvas = document.createElement('canvas');
+const AW = 96, AH = 72;
+analysisCanvas.width = AW; analysisCanvas.height = AH;
+const actx = analysisCanvas.getContext('2d', { willReadFrequently:true });
+
+let prevCentroid = null;
+let prevTime = nowSec();
+let noBlobFrames = 0;
+let cvVerticalSign = 0;
+let cvHorizSign = 0;
+
+async function startCamera(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:320, height:240, facingMode:'environment' }, audio:false });
+    camVideo.srcObject = stream;
+    camDot.classList.add('live');
+    camStatus.textContent = 'Camera live — tracking bright/neon blob';
+    requestAnimationFrame(analyzeLoop);
+  } catch(err){
+    camStatus.textContent = 'Camera unavailable ('+err.name+'). Using simulation only.';
+    document.getElementById('cvToggle').checked = false;
+    document.getElementById('cvToggle').disabled = true;
+    state.cvEnabled = false;
+  }
+}
+
+function analyzeLoop(){
+  requestAnimationFrame(analyzeLoop);
+  if (camVideo.readyState < 2) return;
+
+  // draw overlay canvas at video's displayed size
+  const rect = camVideo.getBoundingClientRect();
+  if (camOverlay.width !== Math.round(rect.width) || camOverlay.height !== Math.round(rect.height)){
+    camOverlay.width = rect.width; camOverlay.height = rect.height;
+  }
+
+  actx.drawImage(camVideo, 0,0, AW, AH);
+  let imgData;
+  try{ imgData = actx.getImageData(0,0,AW,AH).data; } catch(e){ return; }
+
+  let sumX=0,sumY=0,count=0;
+  for (let y=0;y<AH;y++){
+    for (let x=0;x<AW;x++){
+      const i = (y*AW+x)*4;
+      const r=imgData[i], g=imgData[i+1], b=imgData[i+2];
+      const maxc = Math.max(r,g,b), minc = Math.min(r,g,b);
+      const lum = 0.299*r+0.587*g+0.114*b;
+      const sat = maxc===0?0:(maxc-minc)/maxc;
+      const isCandidate = lum>195 || (sat>0.55 && maxc>150);
+      if (isCandidate){ sumX+=x; sumY+=y; count++; }
+    }
+  }
+
+  camOverlayCtx.clearRect(0,0,camOverlay.width,camOverlay.height);
+
+  const minPixels = 10;
+  if (count > minPixels){
+    noBlobFrames = 0;
+    const cx = (sumX/count)/AW, cy = (sumY/count)/AH; // normalized 0..1
+    const px = cx*camOverlay.width, py = cy*camOverlay.height;
+    const radius = clamp(Math.sqrt(count)/AW * camOverlay.width * 1.4, 6, 60);
+
+    camOverlayCtx.strokeStyle = 'rgba(80,255,160,0.9)';
+    camOverlayCtx.lineWidth = 2;
+    camOverlayCtx.beginPath(); camOverlayCtx.arc(px,py,radius,0,Math.PI*2); camOverlayCtx.stroke();
+
+    const tNow = nowSec();
+    const dt = clamp(tNow-prevTime, 0.001, 0.5);
+    if (prevCentroid){
+      const dx = cx-prevCentroid.x, dy = cy-prevCentroid.y;
+      const speedPx = Math.sqrt(dx*dx+dy*dy)/dt;
+      const speedNorm = clamp(speedPx/2.2, 0, 1);
+
+      if (state.cvEnabled){
+        state.heightTarget = clamp(1-cy, 0, 1);
+        state.speedTarget = speedNorm;
+        state.height = lerp(state.height, state.heightTarget, 0.5);
+        markActivity();
+        state.idle = false;
+
+        // heuristic event detection from motion reversal
+        const vSign = Math.sign(dy);
+        const hSign = Math.sign(dx);
+        if (vSign !== 0 && cvVerticalSign > 0 && vSign < 0 && speedNorm>0.35){
+          triggerContact(); // was falling, now rising strongly => contact
+        }
+        if (hSign !== 0 && cvHorizSign !== 0 && hSign !== cvHorizSign && speedNorm>0.5){
+          triggerWallHit();
+        }
+        if (vSign!==0) cvVerticalSign = vSign;
+        if (hSign!==0) cvHorizSign = hSign;
+        state.lastImpactPoint = { x: cx*W, y: cy*H };
+      }
+    }
+    prevCentroid = {x:cx,y:cy};
+    prevTime = tNow;
+  } else {
+    noBlobFrames++;
+    if (state.cvEnabled && noBlobFrames === 20 && prevCentroid && prevCentroid.y > 0.55){
+      // blob disappeared low in frame after being tracked -> likely dropped/settled
+      triggerDrop();
+    }
+    if (state.cvEnabled && noBlobFrames > 90){
+      state.idle = true;
+    }
+    prevCentroid = null;
+  }
+}
+
+/* =========================================================================================
+   IR GATE SIMULATION (non-contact boundary sensor, purely illustrative)
+   ========================================================================================= */
+let irTimer = null;
+function setIrEnabled(on){
+  state.irEnabled = on;
+  clearInterval(irTimer);
+  if (on){
+    irTimer = setInterval(()=>{
+      if (Math.random()<0.5 && !state.idle){
+        markActivity();
+      }
+    }, 2000);
+  }
+}
+
+/* =========================================================================================
+   UI WIRING
+   ========================================================================================= */
+function renderPlayerButtons(){
+  const wrap = document.getElementById('playerButtons');
+  wrap.innerHTML = '';
+  for (let i=0;i<state.numPlayers;i++){
+    const p = PLAYERS[i];
+    const btn = document.createElement('div');
+    btn.className = 'btn playerBtn' + (i===state.activePlayer?' active':'');
+    btn.style.color = hsl(p.hue,80,65);
+    btn.innerHTML = `<span class="swatch" style="background:${hsl(p.hue,80,60)}"></span>${p.name}`;
+    btn.addEventListener('click', ()=> triggerContact(i));
+    wrap.appendChild(btn);
+  }
+}
+
+document.getElementById('beginBtn').addEventListener('click', async ()=>{
+  initAudio();
+  document.getElementById('startOverlay').classList.add('hidden');
+  requestAnimationFrame(render);
+});
+
+document.getElementById('panelToggle').addEventListener('click', ()=>{
+  document.getElementById('devPanel').classList.toggle('open');
+});
+
+document.getElementById('cvToggle').addEventListener('change', (e)=>{
+  state.cvEnabled = e.target.checked;
+  if (state.cvEnabled && !camVideo.srcObject) startCamera();
+});
+
+document.getElementById('irToggle').addEventListener('change', (e)=> setIrEnabled(e.target.checked));
+
+document.getElementById('heightSlider').addEventListener('input', (e)=>{
+  const v = (+e.target.value)/100;
+  state.height = v; state.heightTarget = v;
+  state.manualHeightUntil = nowSec()+2.5;
+  document.getElementById('heightVal').textContent = e.target.value;
+  markActivity();
+});
+document.getElementById('speedSlider').addEventListener('input', (e)=>{
+  const v = (+e.target.value)/100;
+  state.speed = v; state.speedTarget = v;
+  state.manualSpeedUntil = nowSec()+2.5;
+  document.getElementById('speedVal').textContent = e.target.value;
+  markActivity();
+});
+
+document.getElementById('hitBtn').addEventListener('click', ()=> triggerContact((state.activePlayer+1)%state.numPlayers === state.activePlayer ? state.activePlayer : state.activePlayer));
+document.getElementById('dropBtn').addEventListener('click', triggerDrop);
+document.getElementById('wallBtn').addEventListener('click', triggerWallHit);
+document.getElementById('resetBtn').addEventListener('click', resetToIdle);
+
+document.getElementById('rallyToggleBtn').addEventListener('click', ()=>{
+  if (state.running) stopRally(); else startRally();
+});
+
+document.getElementById('npUp').addEventListener('click', ()=>{
+  state.numPlayers = clamp(state.numPlayers+1,1,4);
+  document.getElementById('npVal').textContent = state.numPlayers;
+  renderPlayerButtons();
+});
+document.getElementById('npDown').addEventListener('click', ()=>{
+  state.numPlayers = clamp(state.numPlayers-1,1,4);
+  if (state.activePlayer >= state.numPlayers) state.activePlayer = 0;
+  document.getElementById('npVal').textContent = state.numPlayers;
+  renderPlayerButtons();
+});
+
+renderPlayerButtons();
+logEvent('Idle — waiting for the game to begin');
+
+})();
+</script>
+</body>
+</html>
