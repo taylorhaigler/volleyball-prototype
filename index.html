@@ -526,8 +526,8 @@ function triggerContact(playerIdx){
   state.interactionTimes = state.interactionTimes.filter(x=>nowSec()-x<20);
   state.lastContactTime = nowSec();
   const p = currentPlayer();
-  addFlash(hsl(p.hue,90,60,1), 0.35);
-  addRipple(W/2, H/2, hsl(p.hue,90,60,1), Math.max(W,H)*0.5, 5);
+  // no ripple/flash here — contact is expressed purely through the hue sweep + energy
+  // pulse in the color field itself; ripples are reserved for a detected wall hit.
   playHit(p, false);
   renderPlayerButtons();
   logEvent(`${p.name} — contact`);
@@ -554,8 +554,7 @@ function triggerWallHit(){
 function triggerDrop(){
   markActivity();
   const p = currentPlayer();
-  const x = state.lastImpactPoint ? state.lastImpactPoint.x : W/2;
-  addRipple(x, H*0.94, hsl(p.hue, 20, 96, 1), Math.max(W,H)*0.55, 5);
+  // no ripple here — the drop reads entirely through the floor-collapse gradient below
   state.dropActive = true;
   state.dropStart = nowSec();
   state.heightTarget = 0.02;
